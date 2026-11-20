@@ -9,6 +9,7 @@
 pub mod atspi_app;
 pub mod atspi_sel;
 pub mod gnome;
+pub mod hyprland;
 pub mod kwin;
 pub mod stub;
 pub mod uinput;
@@ -313,6 +314,18 @@ fn pick_injector() -> Box<dyn Backend> {
 /// Choose the active-app provider for this session — independent of injection.
 fn pick_active_app_provider(events: EventSink) -> Option<Box<dyn ActiveAppProvider>> {
     if env_set("WAYLAND_DISPLAY") {
+        // Hyprland: ask the compositor directly. Terminal emulators such as
+        // Alacritty do not reliably appear on the accessibility bus, and a
+        // blank or stale identity there picks the wrong paste chord.
+        if env_set("HYPRLAND_INSTANCE_SIGNATURE") {
+            match hyprland::HyprlandTracker::start(events.clone()) {
+                Ok(t) => {
+                    log::info!("active-app: native Hyprland IPC");
+                    return Some(Box::new(t));
+                }
+                Err(e) => log::warn!("Hyprland IPC unavailable ({e}); falling back to AT-SPI"),
+            }
+        }
         // Tier-2 compositor bridge first (richest), AT-SPI as the universal fallback.
         if wayland::is_kde() {
             match kwin::KwinTracker::start(events.clone()) {
