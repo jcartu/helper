@@ -12,12 +12,12 @@
 //! brand-new event node. An inotify watch on `/dev/input` opens new keyboards
 //! as they appear; a reader whose device is removed drops it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
@@ -105,10 +105,11 @@ struct Capture {
     events: EventSink,
     index: AtomicU64,
     pid: u32,
-    /// Device numbers (`st_rdev`) that have a live reader. A node can be
+    /// Devices with a live reader, by device number (`st_rdev`). A node can be
     /// reported several times (startup scan, `IN_CREATE`, each `IN_ATTRIB`);
-    /// this keeps it to one reader.
-    watched: Mutex<HashSet<u64>>,
+    /// the key keeps it to one reader. The open file is shared with the reader
+    /// so stale-key queries can ask it for key state without reopening.
+    watched: Mutex<HashMap<u64, Arc<File>>>,
 }
 
 impl Capture {
@@ -150,7 +151,14 @@ impl Capture {
             Ok(m) => m.rdev(),
             Err(_) => return false,
         };
-        let fresh = self.watched.lock().is_ok_and(|mut w| w.insert(rdev));
+        let file = Arc::new(file);
+        let fresh = self.watched.lock().is_ok_and(|mut w| {
+            if w.contains_key(&rdev) {
+                return false;
+            }
+            w.insert(rdev, file.clone());
+            true
+        });
         if !fresh {
             return false;
         }
@@ -160,7 +168,7 @@ impl Capture {
         let thread_path = path.to_path_buf();
         let builder = std::thread::Builder::new().name("key-capture-evdev".to_string());
         let spawned = builder.spawn(move || {
-            read_device(&thread_path, file, &cap.events, &cap.index, cap.pid);
+            read_device(&thread_path, &file, &cap.events, &cap.index, cap.pid);
             if let Ok(mut w) = cap.watched.lock() {
                 w.remove(&rdev);
             }
@@ -188,7 +196,7 @@ pub fn start(events: EventSink) -> Option<Box<dyn HeldKeys>> {
         events,
         index: AtomicU64::new(0),
         pid: std::process::id(),
-        watched: Mutex::new(HashSet::new()),
+        watched: Mutex::new(HashMap::new()),
     });
     let found = cap.scan();
     let hotplug = watch_hotplug(cap.clone());
@@ -210,7 +218,7 @@ pub fn start(events: EventSink) -> Option<Box<dyn HeldKeys>> {
             return None;
         }
     }
-    Some(Box::new(EvdevHeld))
+    Some(Box::new(EvdevHeld(cap)))
 }
 
 /// Watch `/dev/input` and add keyboards as they appear. A new node is created
@@ -294,7 +302,7 @@ fn parse_inotify(buf: &[u8]) -> Vec<Inotify<'_>> {
 
 /// Blocking read loop for one device: decode `input_event`s and emit a
 /// `KeypressEvent` for every key press/release (auto-repeat is ignored).
-fn read_device(path: &Path, mut file: File, events: &EventSink, index: &AtomicU64, pid: u32) {
+fn read_device(path: &Path, mut file: &File, events: &EventSink, index: &AtomicU64, pid: u32) {
     let evsize = std::mem::size_of::<libc::input_event>();
     let mut buf = vec![0u8; evsize * 64];
     loop {
@@ -335,40 +343,43 @@ fn read_device(path: &Path, mut file: File, events: &EventSink, index: &AtomicU6
     }
 }
 
-/// Stale-key querier backed by `EVIOCGKEY` across all readable event devices.
-struct EvdevHeld;
+/// Windows VK codes for every key set in an `EVIOCGKEY` state bitmap.
+fn vks_in(bitmap: &[u8]) -> impl Iterator<Item = u32> + '_ {
+    (0..=KEY_MAX as u16)
+        .filter(|&code| bit_set(bitmap, code))
+        .filter_map(keymap::evdev_to_vk)
+}
+
+/// Stale-key querier backed by `EVIOCGKEY` on the devices being captured.
+///
+/// It asks the descriptors the reader threads already hold rather than opening
+/// every node under `/dev/input` per query. The app polls `CheckStaleKeys`
+/// every few seconds on the request loop that also serves `PasteText`, and
+/// closing an evdev descriptor is not cheap: each close waits out an RCU grace
+/// period in the kernel. On a desktop with 24 event nodes one sweep measured
+/// 1.0-1.3 s, which is longer than the app waits for the answer, so the check
+/// timed out every time and held up whatever request was queued behind it.
+///
+/// Only captured devices can have produced a key the app believes is held, so
+/// they are also the only ones whose state can confirm it.
+struct EvdevHeld(Arc<Capture>);
 
 impl HeldKeys for EvdevHeld {
     fn held_vks(&self) -> HashSet<u32> {
-        let mut held = HashSet::new();
-        let dir = match std::fs::read_dir(INPUT_DIR) {
-            Ok(d) => d,
-            Err(_) => return held,
+        // Snapshot under the lock, query outside it: a reader that exits
+        // mid-query keeps its file alive through the `Arc` and the ioctl on an
+        // unplugged device just fails.
+        let files: Vec<Arc<File>> = match self.0.watched.lock() {
+            Ok(watched) => watched.values().cloned().collect(),
+            Err(_) => return HashSet::new(),
         };
-        for entry in dir.flatten() {
-            let path = entry.path();
-            if !is_event_node(&path) {
-                continue;
-            }
-            let file = match OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open(&path)
-            {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
+        let mut held = HashSet::new();
+        for file in files {
             let mut bitmap = [0u8; BITMAP_LEN];
             if unsafe { libc::ioctl(file.as_raw_fd(), eviocgkey(), bitmap.as_mut_ptr()) } < 0 {
                 continue;
             }
-            for code in 0..=KEY_MAX as u16 {
-                if bit_set(&bitmap, code) {
-                    if let Some(vk) = keymap::evdev_to_vk(code) {
-                        held.insert(vk);
-                    }
-                }
-            }
+            held.extend(vks_in(&bitmap));
         }
         held
     }
@@ -422,5 +433,16 @@ mod tests {
         let mut buf = record(libc::IN_CREATE, "event3", 16);
         buf.extend_from_slice(&[0u8; 5]); // less than a header
         assert_eq!(parse_inotify(&buf), vec![Inotify::Name(b"event3")]);
+    }
+
+    #[test]
+    fn vks_in_maps_set_bits_and_skips_unmapped_codes() {
+        let mut bitmap = [0u8; BITMAP_LEN];
+        assert_eq!(vks_in(&bitmap).count(), 0);
+        for code in [KEY_A, KEY_Z] {
+            bitmap[code as usize / 8] |= 1 << (code % 8);
+        }
+        let held: HashSet<u32> = vks_in(&bitmap).collect();
+        assert_eq!(held, HashSet::from([0x41, 0x5A])); // VK_A, VK_Z
     }
 }
